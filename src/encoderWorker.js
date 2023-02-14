@@ -1,6 +1,24 @@
 "use strict";
 
+let debug = true;
+
+if (debug) {
+  var start = (new Date()).valueOf();
+  console.error('encoderWorker created');
+}
+if (debug) {
+  let text = 'fred ';
+  let now = (new Date()).valueOf();
+  console.log(text+(now - start));
+}
+
+
 const OggOpusEncoder = function( config, Module ){
+  if (debug) {
+    let text = 'opus class create ';
+    let now = (new Date()).valueOf();
+    console.log(text+(now - start));
+  }
 
   if ( !Module ) {
     throw new Error('Module with exports required to initialize an encoder instance');
@@ -13,6 +31,8 @@ const OggOpusEncoder = function( config, Module ){
     encoderFrameSize: 20, // Specified in ms.
     encoderSampleRate: 48000, // Desired encoding sample rate. Audio will be resampled
     maxFramesPerPage: 40, // Tradeoff latency with overhead
+    preSkip: 3840,          // preSkip value
+    initialGranulePosition: 0, // initialise our granule posn to this at start.
     numberOfChannels: 1,
     originalSampleRate: 44100,
     resampleQuality: 3, // Value between 0 and 10 inclusive. 10 being highest quality.
@@ -40,37 +60,73 @@ const OggOpusEncoder = function( config, Module ){
   this.segmentTableIndex = 0;
   this.framesInPage = 0;
 
-  this.initChecksumTable();
+  //this.initChecksumTable();
   this.initCodec();
+
   this.initResampler();
+  if (this.config.originalSampleRate !== this.config.encoderSampleRate){
+    this.resample = true;
+  } else {
+    this.resample = false;
+  }
 
   if ( this.config.numberOfChannels === 1 ) {
     this.interleave = function( buffers ) { return buffers[0]; };
   }
+  if (debug) {
+    let text = 'opus class created ';
+    let now = (new Date()).valueOf();
+    console.log(text+(now - start));
+  }
+
 };
 
 OggOpusEncoder.prototype.encode = function( buffers ) {
 
   // Determine bufferLength dynamically
-  if ( !this.bufferLength ) {
-    this.bufferLength = buffers[0].length;
+  // reset if we get passed a larger buffer.
+  let thisBuffLen = buffers[0].length; 
+  if ( !this.bufferLength || this.bufferLength < thisBuffLen) {
+    this.bufferLength = thisBuffLen;
     this.interleavedBuffers = new Float32Array( this.bufferLength * this.config.numberOfChannels );
   }
 
   var samples = this.interleave( buffers );
+  // the interleave buffer MAY be longer than our data - so use the input sample count.
+  let sampleCount = thisBuffLen * this.config.numberOfChannels;
+
+  return this.encodeInterleaved(samples, sampleCount);
+}
+
+
+OggOpusEncoder.prototype.encodeInterleaved = function( samples, sampleCount ) {
+  sampleCount = sampleCount || samples.length;
+
+  if (debug) {
+    let text = 'opus +encode#'+this.counter+' ';
+    let now = (new Date()).valueOf();
+    console.log(text+(now - start));
+  }
+
   var sampleIndex = 0;
   var exportPages = [];
 
-  while ( sampleIndex < samples.length ) {
+  while ( sampleIndex < sampleCount ) {
 
-    var lengthToCopy = Math.min( this.resampleBufferLength - this.resampleBufferIndex, samples.length - sampleIndex );
+    var lengthToCopy = Math.min( this.resampleBufferLength - this.resampleBufferIndex, sampleCount - sampleIndex );
     this.resampleBuffer.set( samples.subarray( sampleIndex, sampleIndex+lengthToCopy ), this.resampleBufferIndex );
     sampleIndex += lengthToCopy;
     this.resampleBufferIndex += lengthToCopy;
 
     if ( this.resampleBufferIndex === this.resampleBufferLength ) {
-      this._speex_resampler_process_interleaved_float( this.resampler, this.resampleBufferPointer, this.resampleSamplesPerChannelPointer, this.encoderBufferPointer, this.encoderSamplesPerChannelPointer );
-      var packetLength = this._opus_encode_float( this.encoder, this.encoderBufferPointer, this.encoderSamplesPerChannel, this.encoderOutputPointer, this.encoderOutputMaxLength );
+      // only resample if we NEED to.
+      // the open encoder is fed with one frame-time of data (e.g. 20ms).
+      if (this.resample){
+        this._speex_resampler_process_interleaved_float( this.resampler, this.resampleBufferPointer, this.resampleSamplesPerChannelPointer, this.encoderBufferPointer, this.encoderSamplesPerChannelPointer );
+        var packetLength = this._opus_encode_float( this.encoder, this.encoderBufferPointer, this.encoderSamplesPerChannel, this.encoderOutputPointer, this.encoderOutputMaxLength );
+      } else {
+        var packetLength = this._opus_encode_float( this.encoder, this.resampleBufferPointer, this.encoderSamplesPerChannel, this.encoderOutputPointer, this.encoderOutputMaxLength );
+      }
       exportPages = exportPages.concat(this.segmentPacket( packetLength ));
       this.resampleBufferIndex = 0;
 
@@ -79,6 +135,12 @@ OggOpusEncoder.prototype.encode = function( buffers ) {
         exportPages.push( this.generatePage() );
       }
     }
+  }
+
+  if (debug) {
+    let text = 'opus -encode#'+this.counter+' ';
+    let now = (new Date()).valueOf();
+    console.log(text+(now - start));
   }
 
   return exportPages;
@@ -100,6 +162,12 @@ OggOpusEncoder.prototype.destroy = function() {
     delete this.resampler;
     this._opus_encoder_destroy(this.encoder);
     delete this.encoder;
+    if (debug) {
+      let text = 'opus class destroy ';
+      let now = (new Date()).valueOf();
+      console.log(text+(now - start));
+    }
+  
   }
 };
 
@@ -117,6 +185,7 @@ OggOpusEncoder.prototype.encodeFinalFrame = function() {
   var exportPages = [];
 
   // Encode the data remaining in the resample buffer.
+  // padding it to 20ms worth...
   if ( this.resampleBufferIndex > 0 ) {
     const dataToFill = (this.resampleBufferLength - this.resampleBufferIndex) / this.config.numberOfChannels;
     const numBuffers = Math.ceil(dataToFill / this.bufferLength);
@@ -138,7 +207,7 @@ OggOpusEncoder.prototype.encodeFinalFrame = function() {
 OggOpusEncoder.prototype.getChecksum = function( data ){
   var checksum = 0;
   for ( var i = 0; i < data.length; i++ ) {
-    checksum = (checksum << 8) ^ this.checksumTable[ ((checksum>>>24) & 0xff) ^ data[i] ];
+    checksum = (checksum << 8) ^ checksumTable[ ((checksum>>>24) & 0xff) ^ data[i] ];
   }
   return checksum >>> 0;
 };
@@ -164,7 +233,7 @@ OggOpusEncoder.prototype.generateIdPage = function(){
   segmentDataView.setUint32( 4, 1684104520, true ) // Magic Signature 'Head'
   segmentDataView.setUint8( 8, 1, true ); // Version
   segmentDataView.setUint8( 9, this.config.numberOfChannels, true ); // Channel count
-  segmentDataView.setUint16( 10, 3840, true ); // pre-skip (80ms)
+  segmentDataView.setUint16( 10, this.config.preSkip, true ); // pre-skip (80ms)
   segmentDataView.setUint32( 12, this.config.originalSampleRateOverride || this.config.originalSampleRate, true ); // original sample rate
   segmentDataView.setUint16( 16, 0, true ); // output gain
   segmentDataView.setUint8( 18, 0, true ); // channel map 0 = mono or stereo
@@ -212,16 +281,19 @@ OggOpusEncoder.prototype.generatePage = function(){
   return exportPage;
 };
 
-OggOpusEncoder.prototype.initChecksumTable = function(){
-  this.checksumTable = [];
+// create the checksum table only once...
+let checksumTable = [];
+let initChecksumTable = function(){
+  checksumTable = [];
   for ( var i = 0; i < 256; i++ ) {
     var r = i << 24;
     for ( var j = 0; j < 8; j++ ) {
       r = ((r & 0x80000000) != 0) ? ((r << 1) ^ 0x04c11db7) : (r << 1);
     }
-    this.checksumTable[i] = (r & 0xffffffff);
+    checksumTable[i] = (r & 0xffffffff);
   }
 };
+initChecksumTable();
 
 OggOpusEncoder.prototype.setOpusControl = function( control, value ){
   var location = this._malloc( 4 );
@@ -271,8 +343,10 @@ OggOpusEncoder.prototype.initResampler = function() {
   this.resampleBuffer = this.HEAPF32.subarray( this.resampleBufferPointer >> 2, (this.resampleBufferPointer >> 2) + this.resampleBufferLength );
 };
 
+// note - may not fill this.interleavedBuffers if input buffer length is shorter
 OggOpusEncoder.prototype.interleave = function( buffers ) {
-  for ( var i = 0; i < this.bufferLength; i++ ) {
+  let len = buffers[0].length;
+  for ( var i = 0; i < len; i++ ) {
     for ( var channel = 0; channel < this.config.numberOfChannels; channel++ ) {
       this.interleavedBuffers[ i * this.config.numberOfChannels + channel ] = buffers[ channel ][ i ];
     }
@@ -324,6 +398,13 @@ if (typeof registerProcessor === 'function') {
             case 'getHeaderPages':
               this.postPage(this.encoder.generateIdPage());
               this.postPage(this.encoder.generateCommentPage());
+              // Match the pre-skip. See chris-rudmin/opus-recorder#248
+              this.granulePosition = this.config.initialGranulePosition;
+              if (debug) {
+                let text = 'getHeaderPages EncoderWorkelet ';
+                let now = (new Date()).valueOf();
+                console.log(text+(now - start));
+              }
               break;
 
             case 'done':
@@ -331,6 +412,11 @@ if (typeof registerProcessor === 'function') {
               this.encoder.destroy();
               delete this.encoder;
               this.port.postMessage( {message: 'done'} );
+              if (debug) {
+                let text = 'done EncoderWorkelet ';
+                let now = (new Date()).valueOf();
+                console.log(text+(now - start));
+              }
               break;
 
             case 'flush':
@@ -346,12 +432,24 @@ if (typeof registerProcessor === 'function') {
         switch( data['command'] ){
 
           case 'close':
+            if (debug) {
+              let text = 'opus close EncoderWorkelet ';
+              let now = (new Date()).valueOf();
+              console.log(text+(now - start));
+            }
             this.continueProcess = false;
             break;
 
           case 'init':
+            if (debug) {
+              start = (new Date()).valueOf();
+              let text = 'opus init EncoderWorkelet ';
+              let now = (new Date()).valueOf();
+              console.log(text+(now - start));
+            }
             this.encoder = new OggOpusEncoder( data, Module );
             this.port.postMessage( {message: 'ready'} );
+            this.continueProcess = true;
             break;
 
           default:
@@ -382,6 +480,7 @@ else {
   var encoder;
   var postPageGlobal = (pageData) => {
     if (pageData) {
+      pageData.counter = encoder.counter;
       postMessage( pageData, [pageData.page.buffer] );
     }
   }
@@ -390,16 +489,32 @@ else {
     if (encoder) {
       switch( data['command'] ){
 
-        case 'encode':
+        case 'encodeInterleaved': // data.buffer is pre-interleaved float32.
+          encoder.counter++;
+          encoder.encodeInterleaved( data['buffer'] ).forEach(pageData => postPageGlobal(pageData));
+          break;
+
+        case 'encode': // data.buffers array (up to two) of mono float32 arrays.
+          encoder.counter++;
           encoder.encode( data['buffers'] ).forEach(pageData => postPageGlobal(pageData));
           break;
 
         case 'getHeaderPages':
+          if (debug) {
+            let text = 'getHeaderPages scriptproc ';
+            let now = (new Date()).valueOf();
+            console.log(text+(now - start));
+          }
           postPageGlobal(encoder.generateIdPage());
           postPageGlobal(encoder.generateCommentPage());
           break;
 
         case 'done':
+          if (debug) {
+            let text = 'opus done scriptproc ';
+            let now = (new Date()).valueOf();
+            console.log(text+(now - start));
+          }
           encoder.encodeFinalFrame().forEach(pageData => postPageGlobal(pageData));
           encoder.destroy();
           encoder = null;
@@ -419,11 +534,23 @@ else {
     switch( data['command'] ){
 
       case 'close':
+        if (debug) {
+          let text = 'opus close scriptproc ';
+          let now = (new Date()).valueOf();
+          console.log(text+(now - start));
+        }
         close();
         break;
 
       case 'init':
+        if (debug) {
+          start = (new Date()).valueOf();
+          let text = 'opus init scriptproc ';
+          let now = (new Date()).valueOf();
+          console.log(text+(now - start));
+        }
         encoder = new OggOpusEncoder( data, Module );
+        encoder.counter = 0;
         postMessage( {message: 'ready'} );
         break;
 
